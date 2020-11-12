@@ -88,6 +88,7 @@
 #include <string>
 #include <vector>
 #include <exception>
+#include <iterator>
 
 #if defined(BACKWARD_SYSTEM_LINUX)
 
