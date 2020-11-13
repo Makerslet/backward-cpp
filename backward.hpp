@@ -89,6 +89,7 @@
 #include <vector>
 #include <exception>
 #include <iterator>
+#include <functional>
 
 #if defined(BACKWARD_SYSTEM_LINUX)
 
@@ -4076,9 +4077,10 @@ private:
 /*************** SIGNALS HANDLING ***************/
 
 #if defined(BACKWARD_SYSTEM_LINUX) || defined(BACKWARD_SYSTEM_DARWIN)
-
 class SignalHandling {
 public:
+  typedef std::function<void(StackTrace&)> OptionalHandler;
+
   static std::vector<int> make_default_signals() {
     const int posix_signals[] = {
       // Signals for which the default action is "Core".
@@ -4146,6 +4148,17 @@ public:
 
   bool loaded() const { return _loaded; }
 
+  static OptionalHandler getOrSetHandler(OptionalHandler new_handler = OptionalHandler())
+  {
+      static OptionalHandler handler;
+
+      if(new_handler)
+          handler = new_handler;
+
+      return handler;
+  }
+
+
   static void handleSignal(int, siginfo_t *info, void *_ctx) {
     ucontext_t *uctx = static_cast<ucontext_t *>(_ctx);
 
@@ -4181,9 +4194,14 @@ public:
       st.load_here(32, reinterpret_cast<void *>(uctx), info->si_addr);
     }
 
-    Printer printer;
-    printer.address = true;
-    printer.print(st, stderr);
+    auto optional_handler = getOrSetHandler();
+    if(optional_handler) {
+        optional_handler(st);
+    } else {
+        Printer printer;
+        printer.address = true;
+        printer.print(st, stderr);
+    }
 
 #if _XOPEN_SOURCE >= 700 || _POSIX_C_SOURCE >= 200809L
     psiginfo(info, nullptr);
