@@ -4076,11 +4076,11 @@ private:
 
 /*************** SIGNALS HANDLING ***************/
 
+typedef std::function<void(StackTrace&)> UserHandler;
+
 #if defined(BACKWARD_SYSTEM_LINUX) || defined(BACKWARD_SYSTEM_DARWIN)
 class SignalHandling {
 public:
-  typedef std::function<void(StackTrace&)> OptionalHandler;
-
   static std::vector<int> make_default_signals() {
     const int posix_signals[] = {
       // Signals for which the default action is "Core".
@@ -4148,13 +4148,9 @@ public:
 
   bool loaded() const { return _loaded; }
 
-  static OptionalHandler getOrSetHandler(OptionalHandler new_handler = OptionalHandler())
+  static UserHandler &user_handler()
   {
-      static OptionalHandler handler;
-
-      if(new_handler)
-          handler = new_handler;
-
+      static UserHandler handler;
       return handler;
   }
 
@@ -4194,7 +4190,7 @@ public:
       st.load_here(32, reinterpret_cast<void *>(uctx), info->si_addr);
     }
 
-    auto optional_handler = getOrSetHandler();
+    auto optional_handler = user_handler();
     if(optional_handler) {
         optional_handler(st);
     } else {
@@ -4259,6 +4255,8 @@ public:
           }
           cv().notify_one();
         }) {
+
+    thread_handle() = reporter_thread_.native_handle();
     SetUnhandledExceptionFilter(crash_handler);
 
     signal(SIGABRT, signal_handler);
@@ -4282,6 +4280,12 @@ public:
     reporter_thread_.join();
   }
 
+  static UserHandler &user_handler()
+  {
+    static UserHandler handler;
+    return handler;
+  }
+
 private:
   static CONTEXT *ctx() {
     static CONTEXT data;
@@ -4289,6 +4293,12 @@ private:
   }
 
   enum class crash_status { running, crashed, normal_exit, ending };
+
+  static void* &error_addr()
+  {
+      static void* error_addr = NULL;
+      return error_addr;
+  }
 
   static crash_status &crashed() {
     static crash_status data;
@@ -4353,12 +4363,11 @@ private:
   NOINLINE static LONG WINAPI crash_handler(EXCEPTION_POINTERS *info) {
     // The exception info supplies a trace from exactly where the issue was,
     // no need to skip records
-    crash_handler(0, info->ContextRecord);
+    crash_handler(0, info->ContextRecord, info->ExceptionRecord->ExceptionAddress);
     return EXCEPTION_CONTINUE_SEARCH;
   }
 
-  NOINLINE static void crash_handler(int skip, CONTEXT *ct = nullptr) {
-
+  NOINLINE static void crash_handler(int skip, CONTEXT *ct = nullptr, void *err_addr = nullptr) {
     if (ct == nullptr) {
       RtlCaptureContext(ctx());
     } else {
@@ -4373,6 +4382,7 @@ private:
     {
       std::unique_lock<std::mutex> lk(mtx());
       crashed() = crash_status::crashed;
+      error_addr() = err_addr;
     }
 
     cv().notify_one();
@@ -4389,17 +4399,21 @@ private:
     // macros.
     // StackTrace also requires that the PDBs are already loaded, which is done
     // in the constructor of TraceResolver
-    Printer printer;
 
     StackTrace st;
-    st.set_machine_type(printer.resolver().machine_type());
-    st.set_context(ctx());
     st.set_thread_handle(thread_handle());
-    st.load_here(32 + skip_frames);
+    st.load_here(32 + skip_frames, ctx(), error_addr());
     st.skip_n_firsts(skip_frames);
 
-    printer.address = true;
-    printer.print(st, std::cerr);
+    auto optional_handler = user_handler();
+    if(optional_handler)
+        optional_handler(st);
+    else {
+        Printer printer;
+        printer.address = true;
+        printer.object = true;
+        printer.print(st, std::cerr);
+    }
   }
 };
 
