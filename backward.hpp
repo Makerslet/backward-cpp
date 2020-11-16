@@ -1104,6 +1104,41 @@ public:
 
 #elif defined(BACKWARD_SYSTEM_WINDOWS)
 
+struct module_data {
+  std::string image_name;
+  std::string module_name;
+  void *base_address;
+  DWORD load_size;
+};
+
+class get_mod_info {
+  HANDLE process;
+  static const int buffer_length = 4096;
+
+public:
+  get_mod_info(HANDLE h) : process(h) {}
+
+  module_data operator()(HMODULE module) {
+    module_data ret;
+    char temp[buffer_length];
+    MODULEINFO mi;
+
+    GetModuleInformation(process, module, &mi, sizeof(mi));
+    ret.base_address = mi.lpBaseOfDll;
+    ret.load_size = mi.SizeOfImage;
+
+    GetModuleFileNameExA(process, module, temp, sizeof(temp));
+    ret.image_name = temp;
+    GetModuleBaseNameA(process, module, temp, sizeof(temp));
+    ret.module_name = temp;
+    std::vector<char> img(ret.image_name.begin(), ret.image_name.end());
+    std::vector<char> mod(ret.module_name.begin(), ret.module_name.end());
+    SymLoadModule64(process, 0, &img[0], &mod[0], (DWORD64)ret.base_address,
+                    ret.load_size);
+    return ret;
+  }
+};
+
 template <>
 class StackTraceImpl<system_tag::current_tag> : public StackTraceImplHolder {
 public:
@@ -1112,6 +1147,21 @@ public:
   void set_machine_type(DWORD machine_type) { machine_type_ = machine_type; }
   void set_context(CONTEXT *ctx) { ctx_ = ctx; }
   void set_thread_handle(HANDLE handle) { thd_ = handle; }
+
+  NOINLINE
+  void *load_modules_symbols(HANDLE process, DWORD pid) {
+    std::vector<module_data> modules;
+
+    DWORD cbNeeded;
+    std::vector<HMODULE> module_handles(1);
+
+    EnumProcessModules(process, &module_handles[0], module_handles.size() * sizeof(HMODULE), &cbNeeded);
+    module_handles.resize(cbNeeded/sizeof(HMODULE));
+    EnumProcessModules(process, &module_handles[0], module_handles.size() * sizeof(HMODULE), &cbNeeded);
+
+    std::transform(module_handles.begin(), module_handles.end(), std::back_inserter(modules), get_mod_info(process));
+    return modules[0].base_address;
+  }
 
   NOINLINE
   size_t load_here(size_t depth = 32, void *context = nullptr,
@@ -1134,9 +1184,16 @@ public:
     }
 
     HANDLE process = GetCurrentProcess();
+    SymInitialize(process, NULL, false);
+
+    DWORD symOptions = SymGetOptions();
+    symOptions |= SYMOPT_LOAD_LINES;
+    symOptions &= ~SYMOPT_UNDNAME;
+    SymSetOptions(symOptions);
+
+    void *base = load_modules_symbols(process, GetCurrentProcessId());
 
     STACKFRAME64 s;
-    memset(&s, 0, sizeof(STACKFRAME64));
 
     // TODO: 32 bit context capture
     s.AddrStack.Mode = AddrModeFlat;
@@ -1160,10 +1217,13 @@ public:
 #endif
     }
 
+    IMAGE_NT_HEADERS *h = ImageNtHeader(base);
+    DWORD image_type = h->FileHeader.Machine;
+
     for (;;) {
       // NOTE: this only works if PDBs are already loaded!
       SetLastError(0);
-      if (!StackWalk64(machine_type_, process, thd_, &s, ctx_, NULL,
+      if (!StackWalk64(image_type, process, thd_, &s, ctx_, NULL,
                        SymFunctionTableAccess64, SymGetModuleBase64, NULL))
         break;
 
@@ -3506,41 +3566,6 @@ class TraceResolverImpl<system_tag::darwin_tag>
 // Load all symbol info
 // Based on:
 // https://stackoverflow.com/questions/6205981/windows-c-stack-trace-from-a-running-app/28276227#28276227
-
-struct module_data {
-  std::string image_name;
-  std::string module_name;
-  void *base_address;
-  DWORD load_size;
-};
-
-class get_mod_info {
-  HANDLE process;
-  static const int buffer_length = 4096;
-
-public:
-  get_mod_info(HANDLE h) : process(h) {}
-
-  module_data operator()(HMODULE module) {
-    module_data ret;
-    char temp[buffer_length];
-    MODULEINFO mi;
-
-    GetModuleInformation(process, module, &mi, sizeof(mi));
-    ret.base_address = mi.lpBaseOfDll;
-    ret.load_size = mi.SizeOfImage;
-
-    GetModuleFileNameExA(process, module, temp, sizeof(temp));
-    ret.image_name = temp;
-    GetModuleBaseNameA(process, module, temp, sizeof(temp));
-    ret.module_name = temp;
-    std::vector<char> img(ret.image_name.begin(), ret.image_name.end());
-    std::vector<char> mod(ret.module_name.begin(), ret.module_name.end());
-    SymLoadModule64(process, 0, &img[0], &mod[0], (DWORD64)ret.base_address,
-                    ret.load_size);
-    return ret;
-  }
-};
 
 template <> class TraceResolverImpl<system_tag::windows_tag> {
 public:
